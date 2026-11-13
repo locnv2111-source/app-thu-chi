@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useState } from 'react';
+import { supabase } from './supabaseClient.js';
 
 const DEFAULT_CATEGORIES = {
   expense: ['Ăn uống', 'Đi lại', 'Mua sắm', 'Nhà cửa', 'Sức khỏe', 'Giải trí', 'Hóa đơn', 'Khác'],
@@ -14,7 +15,9 @@ function readStorage(key, fallback) {
 }
 
 export default function App() {
-  const [transactions, setTransactions] = useState(() => readStorage('so-thu-chi-transactions', []));
+  const [transactions, setTransactions] = useState([]);
+  const [dbStatus, setDbStatus] = useState('connecting');
+  const [dbError, setDbError] = useState('');
   const [categories, setCategories] = useState(() => readStorage('so-thu-chi-categories', DEFAULT_CATEGORIES));
   const [budgets, setBudgets] = useState(() => readStorage('so-thu-chi-budgets', {}));
   const [month, setMonth] = useState(thisMonth);
@@ -24,9 +27,44 @@ export default function App() {
   const [budgetInput, setBudgetInput] = useState('');
   const [newCategory, setNewCategory] = useState('');
 
-  useEffect(() => localStorage.setItem('so-thu-chi-transactions', JSON.stringify(transactions)), [transactions]);
   useEffect(() => localStorage.setItem('so-thu-chi-categories', JSON.stringify(categories)), [categories]);
   useEffect(() => localStorage.setItem('so-thu-chi-budgets', JSON.stringify(budgets)), [budgets]);
+
+  useEffect(() => {
+    if (!supabase) {
+      setDbStatus('missing-config');
+      return undefined;
+    }
+
+    let active = true;
+    const loadTransactions = async () => {
+      const { data, error } = await supabase
+        .from('transactions')
+        .select('*')
+        .order('date', { ascending: false })
+        .order('created_at', { ascending: false });
+      if (!active) return;
+      if (error) {
+        setDbStatus('error');
+        setDbError(error.message);
+        return;
+      }
+      setTransactions(data.map((row) => ({ ...row, amount: Number(row.amount) })));
+      setDbStatus('connected');
+      setDbError('');
+    };
+
+    loadTransactions();
+    const channel = supabase
+      .channel('public-transactions-changes')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'transactions' }, loadTransactions)
+      .subscribe();
+
+    return () => {
+      active = false;
+      supabase.removeChannel(channel);
+    };
+  }, []);
 
   const monthTransactions = useMemo(() => transactions.filter((item) => item.date.startsWith(month)), [transactions, month]);
   const visibleTransactions = useMemo(() => monthTransactions.filter((item) => filterType === 'all' || item.type === filterType).sort((a, b) => b.date.localeCompare(a.date)), [monthTransactions, filterType]);
@@ -39,10 +77,27 @@ export default function App() {
   function changeType(type) {
     setForm((current) => ({ ...current, type, category: categories[type][0] || '' }));
   }
-  function saveTransaction(event) {
+  async function saveTransaction(event) {
     event.preventDefault();
     if (!Number(form.amount) || Number(form.amount) <= 0) return;
+    if (!supabase) {
+      setDbError('Chưa có cấu hình Supabase. Hãy tạo file .env.local rồi khởi động lại app.');
+      return;
+    }
     const item = { ...form, amount: Number(form.amount), id: editingId || crypto.randomUUID() };
+    const { error } = await supabase.from('transactions').upsert({
+      id: item.id,
+      type: item.type,
+      amount: item.amount,
+      category: item.category,
+      date: item.date,
+      note: item.note,
+    });
+    if (error) {
+      setDbError(error.message);
+      return;
+    }
+    setDbError('');
     setTransactions((current) => editingId ? current.map((row) => row.id === editingId ? item : row) : [item, ...current]);
     setEditingId(null);
     setForm({ type: 'expense', amount: '', category: categories.expense[0] || '', date: today, note: '' });
@@ -52,8 +107,14 @@ export default function App() {
     setForm({ type: item.type, amount: String(item.amount), category: item.category, date: item.date, note: item.note || '' });
     window.scrollTo({ top: 0, behavior: 'smooth' });
   }
-  function deleteTransaction(id) {
-    if (window.confirm('Xóa giao dịch này?')) setTransactions((current) => current.filter((item) => item.id !== id));
+  async function deleteTransaction(id) {
+    if (!window.confirm('Xóa giao dịch này?')) return;
+    const { error } = await supabase.from('transactions').delete().eq('id', id);
+    if (error) {
+      setDbError(error.message);
+      return;
+    }
+    setTransactions((current) => current.filter((item) => item.id !== id));
   }
   function saveBudget(event) {
     event.preventDefault();
@@ -75,7 +136,8 @@ export default function App() {
   }
 
   return <main className="app-shell">
-    <header className="topbar"><a className="brand" href="#top"><span className="brand-icon">₫</span><span>Sổ <b>Thu Chi</b><small>Quản lý tiền bạc nhẹ nhàng</small></span></a><span className="local-badge"><i /> Dữ liệu lưu trên thiết bị</span></header>
+    <header className="topbar"><a className="brand" href="#top"><span className="brand-icon">₫</span><span>Sổ <b>Thu Chi</b><small>Quản lý tiền bạc nhẹ nhàng</small></span></a><span className="local-badge"><i /> {dbStatus === 'connected' ? 'Đang đồng bộ trực tuyến' : dbStatus === 'error' ? 'Lỗi kết nối database' : dbStatus === 'missing-config' ? 'Thiếu cấu hình database' : 'Đang kết nối database...'}</span></header>
+    {dbError && <div className="database-alert" role="alert">{dbError}</div>}
     <section className="intro" id="top"><div><p className="eyebrow">TỔNG QUAN TÀI CHÍNH</p><h1>Chào bạn, hôm nay<br /><span>mình quản lý tiền nhé.</span></h1><p className="muted">Ghi lại từng khoản nhỏ để hiểu rõ dòng tiền của bạn.</p></div><label className="month-picker">Tháng xem<select value={month} onChange={(e) => setMonth(e.target.value)}><option value={thisMonth}>Tháng hiện tại</option><option value={new Date(Date.now() - 86400000 * 30).toISOString().slice(0, 7)}>Tháng trước</option></select><input aria-label="Chọn tháng" type="month" value={month} onChange={(e) => setMonth(e.target.value)} /></label></section>
 
     <section className="summary-grid" aria-label="Tổng quan"><article className="summary-card balance-card"><div className="card-heading"><span>Số dư tất cả</span><span className="icon">◈</span></div><strong>{money(balance)}</strong><small>Tính từ tất cả giao dịch đã ghi</small></article><article className="summary-card"><div className="card-heading"><span>Khoản thu tháng này</span><span className="icon green">↗</span></div><strong className="green-text">{money(income)}</strong><small>{monthTransactions.filter((t) => t.type === 'income').length} giao dịch</small></article><article className="summary-card"><div className="card-heading"><span>Khoản chi tháng này</span><span className="icon coral">↘</span></div><strong className="coral-text">{money(expense)}</strong><small>{monthTransactions.filter((t) => t.type === 'expense').length} giao dịch</small></article></section>
